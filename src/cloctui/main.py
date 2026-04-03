@@ -12,6 +12,7 @@ from typing import TypedDict, Union, cast, Any
 import subprocess
 import os
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from enum import Enum
 from functools import partial
@@ -65,6 +66,88 @@ class ClocHeader(TypedDict):
 
 
 ClocJsonResult = dict[str, Union[ClocFileStats, ClocSummaryStats, ClocHeader]]
+
+
+@dataclass
+class TreeNode:
+    """Represents a single node (file or directory) in the tree explorer view."""
+
+    path: str  # Full normalized path (key in the tree dict)
+    name: str  # Display name (basename)
+    is_dir: bool  # True for directory nodes
+    depth: int  # Indentation depth (0 = top level)
+    expanded: bool  # Whether a directory node is expanded
+    stats: ClocFileStats  # Aggregated stats (directories sum children)
+    children: list[str]  # Ordered child paths
+    parent: str | None  # Parent node path, or None for root nodes
+
+
+def build_dir_tree(files_data: dict[str, ClocFileStats]) -> dict[str, TreeNode]:
+    """Build a hierarchical tree structure from flat CLOC file data.
+
+    Args:
+        files_data: Mapping of file paths to their CLOC stats.
+
+    Returns:
+        Ordered dict mapping normalized paths to TreeNode objects.
+        Directory nodes aggregate stats from all descendant files.
+        Top-level directories are expanded by default; deeper ones are collapsed.
+    """
+    tree: dict[str, TreeNode] = {}
+
+    for file_path, stats in files_data.items():
+        # Normalize separators and strip a leading './'
+        norm = file_path.replace("\\", "/")
+        if norm.startswith("./"):
+            norm = norm[2:]
+        parts = norm.split("/")
+
+        # Create or update every ancestor directory node
+        for depth in range(len(parts) - 1):
+            dir_path = "/".join(parts[: depth + 1])
+            parent_path: str | None = "/".join(parts[:depth]) if depth > 0 else None
+
+            if dir_path not in tree:
+                dir_stats: ClocFileStats = {"blank": 0, "comment": 0, "code": 0, "language": "[dir]"}
+                tree[dir_path] = TreeNode(
+                    path=dir_path,
+                    name=parts[depth],
+                    is_dir=True,
+                    depth=depth,
+                    expanded=(depth == 0),  # expand only the first level by default
+                    stats=dir_stats,
+                    children=[],
+                    parent=parent_path,
+                )
+
+            # Register this directory as a child of its own parent
+            if parent_path is not None and parent_path in tree:
+                if dir_path not in tree[parent_path].children:
+                    tree[parent_path].children.append(dir_path)
+
+            # Aggregate file stats up to each ancestor directory
+            tree[dir_path].stats["blank"] += stats["blank"]
+            tree[dir_path].stats["comment"] += stats["comment"]
+            tree[dir_path].stats["code"] += stats["code"]
+
+        # Create the leaf file node
+        file_depth = len(parts) - 1
+        file_parent: str | None = "/".join(parts[:-1]) if len(parts) > 1 else None
+        tree[norm] = TreeNode(
+            path=norm,
+            name=parts[-1],
+            is_dir=False,
+            depth=file_depth,
+            expanded=False,
+            stats=stats,
+            children=[],
+            parent=file_parent,
+        )
+        if file_parent is not None and file_parent in tree:
+            if norm not in tree[file_parent].children:
+                tree[file_parent].children.append(norm)
+
+    return tree
 
 
 class SortableText(Text):
@@ -184,6 +267,7 @@ class CustomDataTable(DataTable[Any]):
         NO_GROUP = 0
         GROUP_BY_LANG = 1
         GROUP_BY_DIR = 2
+        TREE_VIEW = 3
 
     # ** Source of Truth ** #
     COL_SIZES = {
@@ -199,17 +283,20 @@ class CustomDataTable(DataTable[Any]):
     def __init__(
         self,
         files_data_grouped: dict[str, dict[str, ClocFileStats]],
+        files_tree: dict[str, TreeNode],
         group_mode: CustomDataTable.UpdateMode,
     ) -> None:
+        is_tree = group_mode == CustomDataTable.UpdateMode.TREE_VIEW
         super().__init__(
             zebra_stripes=True,
-            show_cursor=False,
-            # cursor_type="column",
+            show_cursor=is_tree,
+            cursor_type="row" if is_tree else "cell",
         )
         # self.files_data_grouped = files_data_grouped
         self.files_data = files_data_grouped["no_group"]
         self.files_by_language = files_data_grouped["files_by_lang"]
         self.files_by_dir = files_data_grouped["files_by_dir"]
+        self.files_tree = files_tree
         self.initialized = False
 
         self.group_mode: CustomDataTable.UpdateMode = group_mode
@@ -237,6 +324,8 @@ class CustomDataTable(DataTable[Any]):
             self.update_table(self.files_by_language, CustomDataTable.UpdateMode.GROUP_BY_LANG)
         elif self.group_mode == CustomDataTable.UpdateMode.GROUP_BY_DIR:
             self.update_table(self.files_by_dir, CustomDataTable.UpdateMode.GROUP_BY_DIR)
+        elif self.group_mode == CustomDataTable.UpdateMode.TREE_VIEW:
+            self.update_table_tree()
         else:
             raise RuntimeError(f"Invalid group mode {self.group_mode}")
 
@@ -290,6 +379,7 @@ class CustomDataTable(DataTable[Any]):
         if (
             update_mode == CustomDataTable.UpdateMode.NO_GROUP
             or update_mode == CustomDataTable.UpdateMode.GROUP_BY_DIR
+            or update_mode == CustomDataTable.UpdateMode.TREE_VIEW
         ):
             first_col = self.columns[ColumnKey("path")]
         else:
@@ -331,6 +421,113 @@ class CustomDataTable(DataTable[Any]):
         if not self.initialized:
             self.initialized = True
             self.post_message(CustomDataTable.TableInitialized())
+
+    # ------------------------------------------------------------------
+    # Tree-view helpers
+    # ------------------------------------------------------------------
+
+    def _get_visible_nodes(self) -> list[TreeNode]:
+        """Return tree nodes that should be visible in the current expand state."""
+        visible: list[TreeNode] = []
+        root_nodes = sorted(
+            [n for n in self.files_tree.values() if n.parent is None],
+            key=lambda n: n.path,
+        )
+
+        def _add(node: TreeNode) -> None:
+            visible.append(node)
+            if node.is_dir and node.expanded:
+                children = sorted(
+                    [self.files_tree[c] for c in node.children if c in self.files_tree],
+                    key=lambda n: (not n.is_dir, n.name.lower()),
+                )
+                for child in children:
+                    _add(child)
+
+        for root in root_nodes:
+            _add(root)
+        return visible
+
+    def update_table_tree(self) -> None:
+        """Clear and re-render the tree view based on the current expand state."""
+        self.clear()
+
+        for node in self._get_visible_nodes():
+            indent = "  " * node.depth
+            if node.is_dir:
+                icon = "▶ " if not node.expanded else "▼ "
+                path_text = SortableText(f"{indent}{icon}{node.name}/", overflow="ellipsis")
+            else:
+                prefix = f"{indent}  "
+                path_text = SortableText(f"{prefix}{node.name}", overflow="ellipsis")
+                if "." in node.name and not node.name.startswith("."):
+                    ext_idx = node.name.rindex(".")
+                    path_text.stylize("dark_orange", start=len(prefix) + ext_idx)
+
+            lang = "[dir]" if node.is_dir else node.stats["language"]
+            self.add_row(
+                path_text,
+                lang,
+                node.stats["blank"],
+                node.stats["comment"],
+                node.stats["code"],
+                node.stats["blank"] + node.stats["comment"] + node.stats["code"],
+                key=node.path,
+            )
+
+        self.call_after_refresh(
+            self.calculate_first_column_size,
+            update_mode=CustomDataTable.UpdateMode.TREE_VIEW,
+        )
+
+    def _current_tree_node_path(self) -> str | None:
+        """Return the path of the tree node at the current cursor row, or None."""
+        if not self.ordered_rows:
+            return None
+        try:
+            return self.ordered_rows[self.cursor_row].key.value
+        except IndexError:
+            return None
+
+    def _move_cursor_to_path(self, path: str) -> None:
+        """Move the cursor to the row whose key matches *path*."""
+        for i, row in enumerate(self.ordered_rows):
+            if row.key.value == path:
+                self.move_cursor(row=i)
+                break
+
+    def toggle_tree_node(self, path: str) -> None:
+        """Toggle the expanded/collapsed state of a directory node."""
+        if path not in self.files_tree:
+            return
+        node = self.files_tree[path]
+        if not node.is_dir:
+            return
+        node.expanded = not node.expanded
+        self.update_table_tree()
+        self.call_after_refresh(self._move_cursor_to_path, path)
+
+    def expand_tree_node(self, path: str) -> None:
+        """Expand a collapsed directory node."""
+        if path not in self.files_tree:
+            return
+        node = self.files_tree[path]
+        if not node.is_dir or node.expanded:
+            return
+        node.expanded = True
+        self.update_table_tree()
+        self.call_after_refresh(self._move_cursor_to_path, path)
+
+    def collapse_tree_node(self, path: str) -> None:
+        """Collapse an expanded directory node."""
+        if path not in self.files_tree:
+            return
+        node = self.files_tree[path]
+        if not node.is_dir or not node.expanded:
+            return
+        node.expanded = False
+        self.update_table_tree()
+        self.call_after_refresh(self._move_cursor_to_path, path)
 
     @on(DataTable.HeaderSelected)
     def header_selected(self, event: DataTable.HeaderSelected) -> None:
@@ -452,7 +649,7 @@ class SummaryBar(Horizontal):
         first_col_size = message.size
         sum_label = self.query_one("#sum_label", Static)
         files_label = self.query_one("#sum_files", Static)
-        if mode == CustomDataTable.UpdateMode.NO_GROUP:
+        if mode == CustomDataTable.UpdateMode.NO_GROUP or mode == CustomDataTable.UpdateMode.TREE_VIEW:
             sum_label.display = True
             sum_label.styles.width = first_col_size
             files_label.styles.width = CustomDataTable.COL_SIZES["language"] + 2
@@ -476,6 +673,9 @@ class OptionsBar(Horizontal):
     class NoGroup(Message):
         pass
 
+    class TreeView(Message):
+        pass
+
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
 
@@ -484,6 +684,7 @@ class OptionsBar(Horizontal):
             yield Button("Show files", id="button_no_group", compact=True)
             yield Button("Group by language", id="button_lang", compact=True)
             yield Button("Group by dir", id="button_dir", compact=True)
+            yield Button("Tree view", id="button_tree", compact=True)
 
         # ~ FUTURE VERSION PLAN:
         # yield Input(placeholder="Filter by path", id="options_input")
@@ -496,6 +697,8 @@ class OptionsBar(Horizontal):
             self.post_message(OptionsBar.GroupByDir())
         elif event.button.id == "button_no_group":
             self.post_message(OptionsBar.NoGroup())
+        elif event.button.id == "button_tree":
+            self.post_message(OptionsBar.TreeView())
 
 
 class TableScreen(Screen[None]):
@@ -507,6 +710,8 @@ class TableScreen(Screen[None]):
         Binding("4", "sort_column(3)", "Sort Column 4"),
         Binding("5", "sort_column(4)", "Sort Column 5"),
         Binding("6", "sort_column(5)", "Sort Column 6"),
+        Binding("l", "expand_tree_node", "Expand", show=False),
+        Binding("h", "collapse_tree_node", "Collapse", show=False),
     ]
 
     def __init__(self, worker_result: ClocTUI.WorkerFinished, group_mode: CustomDataTable.UpdateMode):
@@ -515,27 +720,41 @@ class TableScreen(Screen[None]):
         self.header_data = worker_result.header_data
         self.summary_data = worker_result.summary_data
         self.files_data_grouped = worker_result.files_data_grouped
+        self.files_tree = worker_result.files_tree
         self.group_mode = group_mode
-        self.ctrl_nums = "1-6" if group_mode == CustomDataTable.UpdateMode.NO_GROUP else "1-5"
+        if group_mode == CustomDataTable.UpdateMode.TREE_VIEW:
+            self.ctrl_nums = ""
+        elif group_mode == CustomDataTable.UpdateMode.NO_GROUP:
+            self.ctrl_nums = "1-6"
+        else:
+            self.ctrl_nums = "1-5"
 
     def compose(self) -> ComposeResult:
+
+        if self.group_mode == CustomDataTable.UpdateMode.TREE_VIEW:
+            controls_text = (
+                "[orange]Tab[/] Cycle focus │ "
+                "[orange]Enter/l/h[/] Expand/Collapse │ "
+                "[orange]Ctrl+q[/] Quit"
+            )
+        else:
+            controls_text = (
+                "[orange]Tab[/] Cycle focus │ "
+                f"[orange]{self.ctrl_nums}[/] Sort columns │ "
+                "[orange]Click[/] Headers to sort │ "
+                "[orange]Ctrl+q[/] Quit"
+            )
 
         with Vertical(id="header_container"):
             yield HeaderBar(self.header_data)
             yield OptionsBar()
         with Vertical(id="table_container"):
-            self.table = CustomDataTable(self.files_data_grouped, self.group_mode)
+            self.table = CustomDataTable(self.files_data_grouped, self.files_tree, self.group_mode)
             yield self.table
         with Vertical(id="bottom_container"):
             self.summary_bar = SummaryBar(self.summary_data)
             yield self.summary_bar
-            yield Static(
-                "[orange]Tab[/] Cycle focus │ "
-                f"[orange]{self.ctrl_nums}[/] Sort columns │ "
-                "[orange]Click[/] Headers to sort │ "
-                "[orange]Ctrl+q[/] Quit",
-                id="controls_bar",
-            )
+            yield Static(controls_text, id="controls_bar")
             with Horizontal(id="quit_buttons_container", classes="button_container"):
                 yield Button("Quit", id="quit_button", compact=True)
                 if self.app.is_inline:
@@ -546,8 +765,9 @@ class TableScreen(Screen[None]):
 
         if self.group_mode == CustomDataTable.UpdateMode.NO_GROUP:
             await self.run_action("sort_column(5)")
-        else:
+        elif self.group_mode != CustomDataTable.UpdateMode.TREE_VIEW:
             await self.run_action("sort_column(4)")
+        # For TREE_VIEW, no initial sort — preserve tree order.
 
         # self.app.set_focus(self.query_one(OptionsBar).query_one("#button_no_group"))
 
@@ -580,13 +800,38 @@ class TableScreen(Screen[None]):
         self.summary_bar.update_size(message)
 
     def action_sort_column(self, column_index: int) -> None:
-
+        if self.group_mode == CustomDataTable.UpdateMode.TREE_VIEW:
+            return  # Sorting is not supported in tree view.
         try:
             column = self.table.ordered_columns[column_index]
         except IndexError:
             return
         else:
             self.table.sort_column(column, column.key)
+
+    def action_expand_tree_node(self) -> None:
+        """Expand the directory node currently under the cursor (l key)."""
+        if self.group_mode != CustomDataTable.UpdateMode.TREE_VIEW:
+            return
+        path = self.table._current_tree_node_path()
+        if path is not None:
+            self.table.expand_tree_node(path)
+
+    def action_collapse_tree_node(self) -> None:
+        """Collapse the directory node currently under the cursor (h key)."""
+        if self.group_mode != CustomDataTable.UpdateMode.TREE_VIEW:
+            return
+        path = self.table._current_tree_node_path()
+        if path is not None:
+            self.table.collapse_tree_node(path)
+
+    @on(DataTable.RowSelected)
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Toggle a tree node when its row is selected (Enter key or mouse click)."""
+        if self.group_mode != CustomDataTable.UpdateMode.TREE_VIEW:
+            return
+        if event.row_key.value is not None:
+            self.table.toggle_tree_node(event.row_key.value)
 
     @on(Button.Pressed, "#quit_button")
     def quit_button_pressed(self) -> None:
@@ -619,11 +864,13 @@ class ClocTUI(App[None]):
             header_data: ClocHeader,
             summary_data: ClocSummaryStats,
             files_data_grouped: dict[str, dict[str, ClocFileStats]],
+            files_tree: dict[str, TreeNode],
         ) -> None:
             super().__init__()
             self.header_data = header_data
             self.summary_data = summary_data
             self.files_data_grouped = files_data_grouped
+            self.files_tree = files_tree
 
     def __init__(self, dir_to_scan: str, mode: ClocTUI.AppMode) -> None:
         """
@@ -731,10 +978,13 @@ class ClocTUI(App[None]):
             "files_by_dir": files_by_dir,
         }
 
+        files_tree = build_dir_tree(files_data)
+
         self.worker_finished_msg = ClocTUI.WorkerFinished(
             header_data=header_data,
             summary_data=summary_data,
             files_data_grouped=files_data_grouped,
+            files_tree=files_tree,
         )
 
         self.post_message(self.worker_finished_msg)
@@ -776,4 +1026,14 @@ class ClocTUI(App[None]):
         table_screen.dismiss()
         await self.push_screen(
             TableScreen(self.worker_finished_msg, group_mode=CustomDataTable.UpdateMode.NO_GROUP),
+        )
+
+    @on(OptionsBar.TreeView)
+    async def tree_view(self) -> None:
+
+        table_screen = self.screen
+        assert isinstance(table_screen, TableScreen), "Expected TableScreen instance."
+        table_screen.dismiss()
+        await self.push_screen(
+            TableScreen(self.worker_finished_msg, group_mode=CustomDataTable.UpdateMode.TREE_VIEW),
         )
