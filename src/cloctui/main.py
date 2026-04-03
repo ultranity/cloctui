@@ -287,11 +287,10 @@ class CustomDataTable(DataTable[Any]):
         group_mode: CustomDataTable.UpdateMode,
     ) -> None:
         is_tree = group_mode == CustomDataTable.UpdateMode.TREE_VIEW
-        super().__init__(
-            zebra_stripes=True,
-            show_cursor=is_tree,
-            cursor_type="row" if is_tree else "cell",
-        )
+        init_kwargs: dict[str, Any] = {"zebra_stripes": True, "show_cursor": is_tree}
+        if is_tree:
+            init_kwargs["cursor_type"] = "row"
+        super().__init__(**init_kwargs)
         # self.files_data_grouped = files_data_grouped
         self.files_data = files_data_grouped["no_group"]
         self.files_by_language = files_data_grouped["files_by_lang"]
@@ -439,6 +438,7 @@ class CustomDataTable(DataTable[Any]):
             if node.is_dir and node.expanded:
                 children = sorted(
                     [self.files_tree[c] for c in node.children if c in self.files_tree],
+                    # Directories first (False < True), then alphabetically by name.
                     key=lambda n: (not n.is_dir, n.name.lower()),
                 )
                 for child in children:
@@ -461,6 +461,7 @@ class CustomDataTable(DataTable[Any]):
                 prefix = f"{indent}  "
                 path_text = SortableText(f"{prefix}{node.name}", overflow="ellipsis")
                 if "." in node.name and not node.name.startswith("."):
+                    # rindex finds the last '.' giving the actual file extension.
                     ext_idx = node.name.rindex(".")
                     path_text.stylize("dark_orange", start=len(prefix) + ext_idx)
 
@@ -482,12 +483,10 @@ class CustomDataTable(DataTable[Any]):
 
     def _current_tree_node_path(self) -> str | None:
         """Return the path of the tree node at the current cursor row, or None."""
-        if not self.ordered_rows:
+        rows = self.ordered_rows
+        if not rows or self.cursor_row >= len(rows):
             return None
-        try:
-            return self.ordered_rows[self.cursor_row].key.value
-        except IndexError:
-            return None
+        return rows[self.cursor_row].key.value
 
     def _move_cursor_to_path(self, path: str) -> None:
         """Move the cursor to the row whose key matches *path*."""
